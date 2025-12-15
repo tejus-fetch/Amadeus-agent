@@ -1,0 +1,63 @@
+[project]
+name = "amadeus-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "python-dotenv>=1.2.1",
+    "requests>=2.32.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.8.0",
+    "mypy>=1.12.0",
+    "pytest>=8.3.3",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.6.9",
+    "types-requests>=2.32.0.20241016",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+include = "\\.pyi?$"
+exclude = "(\\.git|\\.mypy_cache|\\.venv|swagger_specification)"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["."]
+exclude = [
+    "swagger_specification",
+    "\\.git",
+    "\\.mypy_cache",
+    "\\.venv",
+]
+
+[tool.ruff.lint]
+select = [
+    "F",   # pyflakes
+    "E", "W",  # pycodestyle
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+
+[tool.mypy]
+python_version = "3.12"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+ignore_missing_imports = true
+follow_imports = "silent"
+exclude = ["swagger_specification"]
+
+[tool.pytest.ini_options]
+addopts = "-q --disable-warnings --maxfail=1"
+testpaths = ["tests"]
+pythonpath = ["."]
