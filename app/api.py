@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
-from datetime import UTC, datetime
+import uuid
+from datetime import datetime
 from typing import Any, Literal
 
 import httpx
@@ -128,14 +130,9 @@ class TransferSearchRequest(LooseBaseModel):
 
     # Required fields
     startDateTime: datetime
-    startLocationCode: str | None = None
-
-    # Optional passenger info
-    passengers: int = Field(default=1, ge=1)
-    language: str = "EN"
-    currency: str | None = None
 
     # Start location options
+    startLocationCode: str | None = None
     startUicCode: str | None = None
     startAddressLine: str | None = None
     startCityName: str | None = None
@@ -157,6 +154,11 @@ class TransferSearchRequest(LooseBaseModel):
     endGeoCode: GeoCode | str | None = None
     endName: str | None = None
     endGooglePlaceId: str | None = None
+
+    # Optional passenger info
+    passengers: int = Field(default=1, ge=1)
+    language: str = "EN"
+    currency: str | None = None
 
     # Transfer options
     transferType: TransferType | None = None
@@ -319,7 +321,72 @@ class TransferOffer(LooseBaseModel):
 
 
 class TransferSearchResponse(LooseBaseModel):
-    data: list[dict[str, Any]] = Field(default_factory=list)  # type: ignore
+    data: list[dict[str, Any]] = Field(default_factory=list)
+    processed: list[dict[str, Any]] = Field(default_factory=list)
+
+    def only_invoice(self) -> None:
+        """Filter offers to only those accepting INVOICE payment."""
+        self.processed = [
+            offer for offer in self.data
+            if "INVOICE" in offer.get("methodsOfPaymentAccepted", [])
+        ]
+
+    def best_offer(self, count: int = 5, page: int = 1) -> None:
+        """Return top N offers sorted by monetary amount."""
+        def get_amount(offer: dict[str, Any]) -> float:
+            try:
+                return float(offer.get("quotation", {}).get("monetaryAmount", "0"))
+            except (ValueError, TypeError):
+                return 0.0
+
+        sorted_offers = sorted(
+            self.data,
+            key=get_amount,
+            reverse=False
+        )
+        start = (page - 1) * count
+        end = start + count
+        self.processed = sorted_offers[start:end]
+
+    def __str__(self) -> str:
+        lines: list[str] = []
+
+        for idx, offer in enumerate(self.processed, start=1):
+            quotation = offer.get("quotation", {})
+            vehicle = offer.get("vehicle", {})
+            provider = offer.get("serviceProvider", {})
+            cancellation = offer.get("cancellationRules", [])
+
+            # Price
+            amount = quotation.get("monetaryAmount", "N/A")
+            currency = quotation.get("currencyCode", "N/A")
+
+            # Vehicle info
+            vehicle_desc = vehicle.get("description", "N/A")
+            vehicle_picture = vehicle.get("imageURL", "N/A")
+            seats = sum(s.get("count", 0) for s in vehicle.get("seats", []))
+            bags = sum(b.get("count", 0) for b in vehicle.get("baggages", []))
+
+            # Cancellation summary (best-effort)
+            cancellation_text = "Cancellation policy varies"
+            if cancellation:
+                cancellation_text = cancellation[0].get(
+                    "ruleDescription",
+                    cancellation_text
+                )
+
+            lines.append(
+                f"Option {idx}:\n"
+                f"- Offer ID: {offer.get('id', 'N/A')}\n"
+                f"- Provider: {provider.get('name', 'N/A')}\n"
+                f"- Price: {amount} {currency}\n"
+                f"- Vehicle: {vehicle_desc}\n"
+                f"- Image: {vehicle_picture}\n"
+                f"- Capacity: {seats} seats, {bags} bags\n"
+                f"- Cancellation: {cancellation_text}"
+            )
+
+        return "\n\n".join(lines)
 
 
 # ============================================================
@@ -389,60 +456,8 @@ class ExtraService(LooseBaseModel):
 class TransferBookingRequest(LooseBaseModel):
     """Request model for booking a transfer."""
 
+    data: dict[str, Any] = Field(default_factory=dict)
     offerId: str
-    passengers: list[Passenger]
-    payment: Payment
-    note: str | None = None
-    flightNumber: str | None = None
-    equipment: list[Equipment] | None = None
-    extraServices: list[ExtraService] | None = None
-    startConnectedSegment: TravelSegment | None = None
-    endConnectedSegment: TravelSegment | None = None
-
-    def to_api(self) -> dict[str, Any]:
-        """Convert request to Amadeus API payload."""
-        data: dict[str, Any] = {
-            "passengers": [],
-            "payment": self.payment.model_dump(exclude_none=True),
-        }
-
-        # Add passengers
-        for p in self.passengers:
-            passenger_data: dict[str, Any] = {
-                "firstName": p.firstName,
-                "lastName": p.lastName,
-            }
-            if p.title:
-                passenger_data["title"] = p.title
-            if p.contacts:
-                passenger_data["contacts"] = p.contacts.model_dump(
-                    exclude_none=True)
-            if p.billingAddress:
-                passenger_data["billingAddress"] = p.billingAddress.model_dump(
-                    exclude_none=True)
-            data["passengers"].append(passenger_data)
-
-        # Add optional fields
-        if self.note:
-            data["note"] = self.note
-        if self.flightNumber:
-            data["flightNumber"] = self.flightNumber
-        if self.equipment:
-            data["equipment"] = [
-                e.model_dump(exclude_none=True) for e in self.equipment
-            ]
-        if self.extraServices:
-            data["extraServices"] = [
-                s.model_dump(exclude_none=True) for s in self.extraServices
-            ]
-        if self.startConnectedSegment:
-            data["startConnectedSegment"] = self.startConnectedSegment.model_dump(
-                exclude_none=True)
-        if self.endConnectedSegment:
-            data["endConnectedSegment"] = self.endConnectedSegment.model_dump(
-                exclude_none=True)
-
-        return {"data": data}
 
 
 class TransferReservation(LooseBaseModel):
@@ -565,25 +580,31 @@ class AmadeusTransferAsyncClient:
         self.base_url = base_url
         self.retries = retries
         self.timeout = timeout
+
         self._client = httpx.AsyncClient(timeout=timeout)
         self._cache = _TTLCache(cache_ttl)
+
         self.token: str | None = None
+        self.token_expires_at: float | None = None
 
     async def _get_token(self) -> str:
-        token_file = ".amadeus_token"
+        token_file = f"{self.base_url.replace('/', '_')}.token_cache"
 
-        # Try to load from file
+        # Load cached token
         if os.path.exists(token_file):
             try:
                 with open(token_file) as f:
-                    self.token = f.read().strip()
-                logger.info("Loaded token from cache")
-                return self.token
-            except Exception as e:
-                logger.warning("Failed to load token from file: %s", e)
+                    token, expires_at = f.read().split("|")
+                    if time.time() < float(expires_at):
+                        self.token = token
+                        self.token_expires_at = float(expires_at)
+                        logger.info("Loaded OAuth token from cache")
+                        return self.token
+            except Exception:
+                pass  # silently refresh
 
-        # Fetch new token
-        logger.info("Fetching OAuth token")
+        logger.info("Fetching new OAuth token")
+
         response = await self._client.post(
             f"{self.base_url}/security/oauth2/token",
             data={
@@ -594,16 +615,16 @@ class AmadeusTransferAsyncClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         response.raise_for_status()
-        self.token = response.json()["access_token"]
-        if not self.token:
-            raise RuntimeError("Failed to obtain OAuth token")
 
-        # Save to file
+        payload = response.json()
+        self.token = payload["access_token"]
+        self.token_expires_at = time.time() + payload["expires_in"] - 30
+
         try:
             with open(token_file, "w") as f:
-                f.write(self.token)
+                f.write(f"{self.token}|{self.token_expires_at}")
         except Exception as e:
-            logger.warning("Failed to save token to file: %s", e)
+            logger.warning("Failed to write token cache: %s", e)
 
         return self.token
 
@@ -615,7 +636,8 @@ class AmadeusTransferAsyncClient:
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not self.token:
+
+        if not self.token or not self.token_expires_at or time.time() >= self.token_expires_at:
             await self._get_token()
 
         for attempt in range(1, self.retries + 1):
@@ -629,13 +651,14 @@ class AmadeusTransferAsyncClient:
                         "Authorization": f"Bearer {self.token}",
                         "Accept": "application/vnd.amadeus+json",
                         "Content-Type": "application/json",
+                        "Idempotency-Key": str(uuid.uuid4()),
                     },
                     json=json,
                     params=params,
                 )
 
                 if response.status_code == 401:
-                    logger.warning("Token expired, refreshing")
+                    logger.warning("OAuth token expired, refreshing")
                     await self._get_token()
                     continue
 
@@ -646,8 +669,7 @@ class AmadeusTransferAsyncClient:
                 logger.error("Request failed: %s", exc)
                 if attempt == self.retries:
                     raise
-                await httpx.AsyncClient().aclose()
-                time.sleep(2 ** attempt)
+                await asyncio.sleep(2 ** attempt)
 
         raise RuntimeError("Unreachable")
 
@@ -658,8 +680,10 @@ class AmadeusTransferAsyncClient:
     async def search_transfers(
         self, request: TransferSearchRequest
     ) -> TransferSearchResponse:
-        cache_key = request.model_dump_json()
-        cached = self._cache.get(cache_key)
+        cache_key = hash(
+            str(sorted(request.model_dump(exclude_none=True).items()))
+        )
+        cached = self._cache.get(str(cache_key))
         if cached:
             logger.info("Returning cached transfer search result")
             return cached
@@ -671,17 +695,16 @@ class AmadeusTransferAsyncClient:
         )
 
         parsed = TransferSearchResponse.model_validate(raw)
-        self._cache.set(cache_key, parsed)
+        self._cache.set(str(cache_key), parsed)
         return parsed
 
     async def book_transfer(
         self, request: TransferBookingRequest
     ) -> TransferBookingResponse:
-        print("\n\n\n", request.to_api(), "\n\n\n")
         raw = await self._request(
             "POST",
             "/ordering/transfer-orders",
-            json=request.to_api(),
+            json=request.data,
             params={"offerId": request.offerId},
         )
         return TransferBookingResponse.model_validate(raw)
@@ -699,286 +722,4 @@ class AmadeusTransferAsyncClient:
         """Close underlying HTTP client."""
         await self._client.aclose()
 
-
-if __name__ == "__main__":
-    import asyncio
-    from datetime import timedelta
-
-    from dotenv import load_dotenv
-
-    load_dotenv()
-
-    async def main() -> None:
-        client = AmadeusTransferAsyncClient()
-
-        # ----------------------------
-        # 1️⃣ Search transfers
-        # ----------------------------
-        # request = TransferSearchRequest(
-        #     startDateTime=datetime.now(UTC) + timedelta(days=3),
-        #     startLocationCode="CDG",
-        #     endAddressLine="5 Avenue Anatole France",
-        #     endCityName="Paris",
-        #     endZipCode="75007",
-        #     endCountryCode="FR",
-        #     endGeoCode=GeoCode(latitude=48.858093, longitude=2.294694),
-        #     transferType="PRIVATE",
-        # )
-
-        # offers = await client.search_transfers(request)
-
-        offer: dict[str, Any] = {
-            "id": "7068429332",
-            "type": "transfer-offer",
-            "language": "EN",
-            "transferType": "PRIVATE",
-            "start": {
-                "dateTime": "2025-12-18T13:57:39",
-                "locationCode": "CDG"
-            },
-            "end": {
-                "dateTime": "2025-12-18T14:57:39",
-                "address": {
-                    "line": "5 Avenue Anatole France",
-                    "zip": "75007",
-                    "countryCode": "FR",
-                    "cityName": "Paris",
-                    "latitude": 48.858093,
-                    "longitude": 2.294694
-                }
-            },
-            "vehicle": {
-                "code": "VAN",
-                "category": "ST",
-                "description": "Toyota Innova or similar",
-                "imageURL": "https://oss.heycars.cn/vehicle/v2/toyoto-Innova-7.png",
-                "baggages": [
-                    {
-                        "count": 4,
-                        "size": "M"
-                    }
-                ],
-                "seats": [
-                    {
-                        "count": 4
-                    }
-                ]
-            },
-            "converted": {
-                "monetaryAmount": "52.63",
-                "currencyCode": "EUR",
-                "totalFees": {
-                    "monetaryAmount": "0"
-                },
-                "base": {
-                    "monetaryAmount": "52.63"
-                }
-            },
-            "serviceProvider": {
-                "code": "HCS",
-                "name": "HeyCars",
-                "termsUrl": "https://oss.heycars.cn/website/TermsOfService.html",
-                "logoUrl": "https://oss.heycars.cn/website/logo1.png",
-                "settings": [
-                    "FLIGHT_NUMBER_REQUIRED",
-                    "CORPORATION_INFO_REQUIRED"
-                ]
-            },
-            "quotation": {
-                "monetaryAmount": "52.63",
-                "currencyCode": "EUR",
-                "totalFees": {
-                    "monetaryAmount": "0"
-                },
-                "base": {
-                    "monetaryAmount": "52.63"
-                }
-            },
-            "supportedPaymentInstruments": [
-                {
-                    "vendorCode": "VI",
-                    "description": "VISA"
-                },
-                {
-                    "vendorCode": "AX",
-                    "description": "AMERICANEXPRESS"
-                },
-                {
-                    "vendorCode": "CA",
-                    "description": "MASTERCARD"
-                },
-                {
-                    "vendorCode": "DC",
-                    "description": "DINERSCLUB"
-                }
-            ],
-            "equipment": [
-                {
-                    "code": "CBS",
-                    "description": "Booster seat for child under 135cm or up to 12 years",
-                    "quotation": {
-                        "monetaryAmount": "12.92",
-                        "currencyCode": "EUR"
-                    },
-                    "isBookable": True,
-                    "taxIncluded": True,
-                    "includedInTotal": False,
-                    "converted": {
-                        "monetaryAmount": "12.92",
-                        "currencyCode": "EUR"
-                    }
-                },
-                {
-                    "code": "CST",
-                    "description": "Child seat determined by weight/age of child: 4-7 years/15-30 Kg",
-                    "quotation": {
-                        "monetaryAmount": "12.92",
-                        "currencyCode": "EUR"
-                    },
-                    "isBookable": True,
-                    "taxIncluded": True,
-                    "includedInTotal": False,
-                    "converted": {
-                        "monetaryAmount": "12.92",
-                        "currencyCode": "EUR"
-                    }
-                }
-            ],
-            "cancellationRules": [
-                {
-                    "feeType": "PERCENTAGE",
-                    "feeValue": "100",
-                    "metricType": "HOURS",
-                    "metricMin": "0",
-                    "metricMax": "18",
-                    "ruleDescription": "Non-refundable within 18 hours of pick-up time"
-                },
-                {
-                    "feeType": "PERCENTAGE",
-                    "feeValue": "0",
-                    "metricType": "HOURS",
-                    "metricMin": "18",
-                    "ruleDescription": "Free cancellation up to 18 hours prior to ride"
-                }
-            ],
-            "methodsOfPaymentAccepted": [
-                "CREDIT_CARD",
-                "INVOICE",
-                "TRAVEL_ACCOUNT"
-            ],
-            "distance": {
-                "value": 30,
-                "unit": "KM"
-            },
-            "extraServices": [
-                {
-                    "code": "FLM",
-                    "description": "Flight monitoring",
-                    "quotation": {
-                        "monetaryAmount": "0.00",
-                        "currencyCode": "EUR"
-                    },
-                    "isBookable": False,
-                    "taxIncluded": True,
-                    "includedInTotal": True,
-                    "converted": {
-                        "monetaryAmount": "0.00",
-                        "currencyCode": "EUR"
-                    }
-                }
-            ]
-        }
-
-        if not offer:
-            print("❌ Offer not found in search results")
-            await client.close()
-            return
-
-        print("Selected offer:")
-        print(offer)
-
-        offer_id = offer.get("id")
-
-        # Provider requires flight number (from response)
-        requires_flight = (
-            "FLIGHT_NUMBER_REQUIRED"
-            in offer.get("serviceProvider", {}).get("settings", [])
-        )
-
-        # ----------------------------
-        # 2️⃣ Book transfer
-        # ----------------------------
-        booking_request = TransferBookingRequest(
-            offerId=offer_id,
-            passengers=[
-                Passenger(
-                    firstName="John",
-                    lastName="Doe",
-                    title="MR",
-                    contacts=Contact(
-                        phoneNumber="+33123456789",
-                        email="john.doe@example.com",
-                    ),
-                )
-            ],
-            payment=Payment(
-                methodOfPayment="INVOICE"
-            ),
-            flightNumber="AF123" if requires_flight else None,
-        )
-
-        booking_response = await client.book_transfer(booking_request)
-        print("\nBooking response:")
-        print(booking_response)
-
-        # Check for errors
-        if booking_response.errors:
-            print("\n❌ Booking failed with errors:")
-            for err in booking_response.errors:
-                if isinstance(err, dict):
-                    print(
-                        f"  - [{err.get('code')}] {err.get('title')}: {err.get('detail')}")
-                else:
-                    print(f"  - [{err.code}] {err.title}: {err.detail}")
-            await client.close()
-            return
-
-        # ----------------------------
-        # 3️⃣ Extract order + confirm number
-        # ----------------------------
-        data = booking_response.data or {}
-
-        if isinstance(data, dict):
-            order_id = data.get("id")
-            transfers = data.get("transfers", [])
-        else:
-            order_id = getattr(data, "id", None)
-            transfers = getattr(data, "transfers", []) or []
-
-        confirm_nbr = None
-        if transfers:
-            first_transfer = transfers[0]
-            if isinstance(first_transfer, dict):
-                confirm_nbr = first_transfer.get("confirmNbr")
-            else:
-                confirm_nbr = getattr(first_transfer, "confirmNbr", None)
-
-        print("\nOrder ID:", order_id)
-        print("Confirm Number:", confirm_nbr)
-
-        # ----------------------------
-        # 4️⃣ Cancel transfer
-        # ----------------------------
-        if order_id and confirm_nbr:
-            cancel_response = await client.cancel_transfer(
-                order_id=order_id,
-                confirm_nbr=confirm_nbr,
-            )
-            print("\nCancel response:")
-            print(cancel_response)
-        else:
-            print("\n❌ Unable to cancel — missing order_id or confirmNbr")
-
-        await client.close()
-
-    asyncio.run(main())
+CLIENT = AmadeusTransferAsyncClient()

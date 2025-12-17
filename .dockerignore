@@ -32,3 +32,7 @@ swagger_specification/
 
 # token files
 *.token_cache
+
+# git
+.git/
+.gitignore
