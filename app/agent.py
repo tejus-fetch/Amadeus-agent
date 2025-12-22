@@ -16,8 +16,8 @@ from app.ai import AI
 def create_agent() -> Agent:
     agent = Agent(
         name="ASI-agent",
-        seed=os.environ.get("AGENT_SEED", "asi-agent-seed-124421"),
-        port=int(os.environ.get("AGENT_PORT", 8000)),
+        seed=os.environ.get("AMADEUS_AGENT_SEED", "asi-agent-seed-124421"),
+        port=int(os.environ.get("AMADEUS_AGENT_PORT", 8000)),
         mailbox=True,
         publish_agent_details=True,
         network="testnet"

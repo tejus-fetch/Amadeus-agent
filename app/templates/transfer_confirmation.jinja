@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Transfer Confirmation</title>
+
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: Arial, sans-serif;
+      background: #f5f7fa;
+      color: #2a2a2a;
+    }
+    .container {
+      width: 100%;
+      padding: 40px 0;
+      background: #f5f7fa;
+    }
+    .email-body {
+      background: #ffffff;
+      max-width: 600px;
+      margin: auto;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+    }
+    .header {
+      background: linear-gradient(90deg, #4f46e5, #3b82f6);
+      color: #ffffff;
+      text-align: center;
+      padding: 28px 20px;
+      font-size: 24px;
+      font-weight: 600;
+    }
+    .content {
+      padding: 30px 22px;
+    }
+    .content h2 {
+      font-size: 20px;
+      margin-bottom: 8px;
+      color: #111827;
+    }
+    .content p {
+      font-size: 15px;
+      line-height: 1.6;
+      color: #374151;
+    }
+    .detail-block {
+      background: #f9fafb;
+      padding: 16px;
+      margin: 16px 0;
+      border-radius: 8px;
+    }
+    .detail-block p {
+      margin: 6px 0;
+      font-size: 14.5px;
+    }
+    .label {
+      color: #6b7280;
+      font-weight: 500;
+    }
+    .value {
+      color: #111827;
+      font-weight: 600;
+    }
+    .footer {
+      text-align: center;
+      padding: 20px;
+      font-size: 13.5px;
+      color: #6b7280;
+      background: #ffffff;
+    }
+    @media only screen and (max-width: 620px) {
+      .header {
+        font-size: 20px;
+      }
+      .content {
+        padding: 24px 18px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <div class="email-body">
+
+      <div class="header">
+        Transfer Booking Confirmed
+      </div>
+
+      <div class="content">
+        <h2>Hello {{ customer_name | default("there") }},</h2>
+        <p>
+          Your transfer has been successfully booked. Below are the details of your journey.
+        </p>
+
+        <div class="detail-block">
+          <p><span class="label">Order ID:</span> <span class="value">{{ order_id }}</span></p>
+          <p><span class="label">Confirmation Number:</span> <span class="value">{{ confirmation_number }}</span></p>
+          <p><span class="label">Pickup Location:</span> <span class="value">{{ pickup_location }}</span></p>
+          <p><span class="label">Drop-off Location:</span> <span class="value">{{ dropoff_location }}</span></p>
+          <p><span class="label">Date & Time:</span> <span class="value">{{ pickup_datetime }}</span></p>
+        </div>
+
+        <div class="detail-block">
+          <p><span class="label">Vehicle:</span> <span class="value">{{ vehicle_type }}</span></p>
+          <p><span class="label">Provider:</span> <span class="value">{{ provider }}</span></p>
+          <p><span class="label">Total Price:</span> <span class="value">{{ price }} {{ currency }}</span></p>
+          <p><span class="label">Cancellation Policy:</span>
+            <span class="value">{{ cancellation_policy }}</span>
+          </p>
+        </div>
+
+        <p>
+          If you have any questions or need assistance, simply reply to this email.
+          We wish you a smooth and comfortable ride.
+        </p>
+      </div>
+
+      <div class="footer">
+        ✈️  Powered by {{ platform_name | default("ASI1") }} · Have a great trip
+      </div>
+
+    </div>
+  </div>
+</body>
+</html>

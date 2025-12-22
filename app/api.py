@@ -348,6 +348,48 @@ class TransferSearchResponse(LooseBaseModel):
         end = start + count
         self.processed = sorted_offers[start:end]
 
+    def to_dict(self) -> dict[str, Any]:
+        information: dict[str, Any] = {}
+
+        for offer in self.processed:
+
+            startLocation = offer.get("start", {}).get(
+                "locationCode",
+                offer.get("start", {}).get("address", {}).get("line", "N/A")
+                )
+            endLocation = offer.get("end", {}).get(
+                "locationCode",
+                offer.get("end", {}).get("address", {}).get("line", "N/A")
+            )
+
+            startDateTime = offer.get("start", {}).get("dateTime", "N/A")
+            offer_id = offer.get("id", "N/A")
+            quotation = offer.get("quotation", {})
+            vehicle = offer.get("vehicle", {})
+            provider = offer.get("serviceProvider", {})
+            cancellation = offer.get("cancellationRules", [])
+
+            information[offer_id] = {
+                "startDateTime": startDateTime,
+                "startLocation": startLocation,
+                "endLocation": endLocation,
+                "provider": provider.get("name", "N/A"),
+                "price": f"{quotation.get('monetaryAmount', 'N/A')} "
+                         f"{quotation.get('currencyCode', 'N/A')}",
+                "vehicle": vehicle.get("description", "N/A"),
+                "image": vehicle.get("imageURL", "N/A"),
+                "capacity": {
+                    "seats": sum(s.get("count", 0) for s in vehicle.get("seats", [])),
+                    "bags": sum(b.get("count", 0) for b in vehicle.get("baggages", [])),
+                },
+                "cancellation": (
+                    cancellation[0].get("ruleDescription", "N/A")
+                    if cancellation else "N/A"
+                ),
+            }
+
+        return information
+
     def __str__(self) -> str:
         lines: list[str] = []
 
