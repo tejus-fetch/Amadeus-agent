@@ -29,6 +29,7 @@ SEARCH FLOW
 2. Call `search_transfers`.
 3. Present results in a short, readable list.
 4. Ask the user which offer they want to book.
+5. If no transfers are available for a given request, DO NOT make up offers on you own, tell user no offers are available.
 
 BOOKING FLOW
 1. Confirm the selected offer ID.

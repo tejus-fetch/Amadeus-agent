@@ -428,6 +428,8 @@ class TransferSearchResponse(LooseBaseModel):
                 f"- Cancellation: {cancellation_text}"
             )
 
+        if len(lines) == 0:
+            return "No transfer offers available. Tell user to modify search criteria."
         return "\n\n".join(lines)
 
 

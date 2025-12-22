@@ -7,16 +7,19 @@ from random import randint
 from typing import Any, Literal
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain.tools import ToolRuntime, tool
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
+from langgraph.types import Command
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, EmailStr, Field
 
 from app.api import CLIENT, TransferBookingRequest, TransferSearchRequest
+import requests
 from app.notification import (
     render_transfer_cancellation_email,
     render_transfer_confirmation_email,
@@ -61,7 +64,23 @@ class Location(BaseModel):
     countryCode: str | None = None
 
     def _get_geo_codes(self) -> str:
-        return "48.858093,2.294694"
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {
+            "q": self.value,
+            "format": "json",
+            "limit": 1
+        }
+        headers = {
+            "User-Agent": "amadeus-agent"
+        }
+
+        res = requests.get(url, params=params, headers=headers)
+        data = res.json()
+
+        if not data:
+            return "48.858093,2.294694"  # Default fallback
+
+        return f"{data[0]['lat']},{data[0]['lon']}"
 
     def to_api(self, locationType: Literal["start", "end"]) -> dict[str, Any]:
         data: dict[str, Any] = {}
@@ -176,7 +195,7 @@ async def add_passengers(
                 len(passengers), runtime.context.agent_id)
     store = runtime.store
 
-    logger.debug("Loading existing user data from store")
+    logger.info("Loading existing user data from store")
     user_data = await store.aget(
         (runtime.context.agent_id,),
         "user_data"
@@ -193,7 +212,7 @@ async def add_passengers(
     existing_passengers = data.get("passengers")
 
     for p in passengers:
-        logger.debug("Adding passenger: %s %s %s",
+        logger.info("Adding passenger: %s %s %s",
                      p.title, p.firstName, p.lastName)
         pid = None
         while pid is None or pid in existing_passengers:
@@ -202,7 +221,7 @@ async def add_passengers(
 
     data["passengers"] = existing_passengers
 
-    logger.debug("Saving updated passenger list to store")
+    logger.info("Saving updated passenger list to store")
     await store.aput(
         (runtime.context.agent_id,),
         "user_data",
@@ -229,7 +248,7 @@ async def list_passengers(
     logger.info("Listing passengers for agent_id=%s", runtime.context.agent_id)
     store = runtime.store
 
-    logger.debug("Loading user data from store")
+    logger.info("Loading user data from store")
     user_data = await store.aget(
         (runtime.context.agent_id,),
         "user_data"
@@ -245,7 +264,7 @@ async def list_passengers(
             data
         )
         existing_passengers = {}
-        logger.debug("No user data found, initialized new user data")
+        logger.info("No user data found, initialized new user data")
     else:
         existing_passengers = user_data.value.get("passengers")
 
@@ -285,7 +304,7 @@ async def remove_passenger(
                 passenger_id, runtime.context.agent_id)
     store = runtime.store
 
-    logger.debug("Loading user data from store")
+    logger.info("Loading user data from store")
     user_data = await store.aget(
         (runtime.context.agent_id,),
         "user_data"
@@ -304,7 +323,7 @@ async def remove_passenger(
     del existing_passengers[passenger_id]
     user_data.value["passengers"] = existing_passengers
 
-    logger.debug("Saving updated passenger list to store")
+    logger.info("Saving updated passenger list to store")
     await store.aput(
         (runtime.context.agent_id,),
         "user_data",
@@ -336,7 +355,7 @@ async def list_active_orders(
     )
 
     if not user_data:
-        logger.debug("No user data found, initializing new user data")
+        logger.info("No user data found, initializing new user data")
         data = {
             "passengers": {},
             "orders": []
@@ -400,19 +419,19 @@ async def search_transfers(
         **start_location,
         **end_location,
     )
-    logger.debug("Transfer search request: %s", req.to_api())
+    logger.info("Transfer search request: %s", req.to_api())
 
-    logger.debug("Calling Amadeus API for transfer search")
+    logger.info("Calling Amadeus API for transfer search")
     response = await client.search_transfers(req)
-    logger.debug("Received response from Amadeus API")
+    logger.info("Received response from Amadeus API")
 
     response.only_invoice()
     response.best_offer(count=offersCount, page=pageCount)
-    logger.info("Filtered to %d best offer(s) with invoice payment", offersCount)
+    logger.info("Filtered to %d best offer(s) with invoice payment", len(response.to_dict()))
 
     store = runtime.store
 
-    logger.debug("Loading previous search responses from store")
+    logger.info("Loading previous search responses from store")
     transfer_search_responses = await store.aget(
         (runtime.context.thread_id, runtime.context.agent_id),
         "transfer_search_responses"
@@ -420,20 +439,20 @@ async def search_transfers(
 
     if not transfer_search_responses:
         data = response.to_dict()
-        logger.debug("No previous search responses, creating new entry")
+        logger.info("No previous search responses, creating new entry")
     else:
         data = transfer_search_responses.value
         data.update(response.to_dict())
-        logger.debug("Merged with existing search responses")
+        logger.info("Merged with existing search responses")
 
-    logger.debug("Saving search responses to store")
+    logger.info(f"Saving search responses to store {data}")
     await store.aput(
         (runtime.context.thread_id, runtime.context.agent_id),
         "transfer_search_responses",
         data
     )
 
-    logger.info("Transfer search completed successfully")
+    logger.info(f"Transfer search completed successfully - {response}")
     return str(response)
 
 
@@ -449,7 +468,7 @@ async def book_transfer(
     client = CLIENT
     store = runtime.store
 
-    logger.debug("Preparing booking data with %d passenger(s)",
+    logger.info("Preparing booking data with %d passenger(s)",
                  len(passengers))
     booking_data: dict[str, Any] = {
         "data": {
@@ -470,7 +489,7 @@ async def book_transfer(
         }
     }
 
-    logger.debug("Loading transfer search responses from store")
+    logger.info("Loading transfer search responses from store")
     transfer_search_responses = await store.aget(
         (runtime.context.thread_id, runtime.context.agent_id),
         "transfer_search_responses"
@@ -483,7 +502,7 @@ async def book_transfer(
     order_data = transfer_search_responses.value.get(offerId)
     if order_data:
         booking_data["offer"] = order_data
-        logger.debug("Found offer data for offerId=%s", offerId)
+        logger.info("Found offer data for offerId=%s", offerId)
     else:
         logger.warning("No offer data found for offerId=%s", offerId)
 
@@ -492,7 +511,7 @@ async def book_transfer(
         data=booking_data
     )
 
-    logger.debug("Calling Amadeus API for transfer booking")
+    logger.info("Calling Amadeus API for transfer booking")
     response = await client.book_transfer(req)
 
     if not response.is_success:
@@ -532,7 +551,7 @@ async def book_transfer(
     logger.info(
         "Booking successful: orderId=%s, confirmationNumber=%s", order_id, confirm_nbr)
 
-    logger.debug("Loading user data to save order")
+    logger.info("Loading user data to save order")
     user_data = await store.aget(
         (runtime.context.agent_id,),
         "user_data"
@@ -541,11 +560,11 @@ async def book_transfer(
     existing_orders = user_data.value.get("orders")
     if existing_orders is None:
         existing_orders = []
-        logger.debug("No existing orders, creating new list")
+        logger.info("No existing orders, creating new list")
 
     existing_orders.append(booking_data)
     user_data.value["orders"] = existing_orders
-    logger.debug("Saving order to user data, total orders: %d",
+    logger.info("Saving order to user data, total orders: %d",
                  len(existing_orders))
 
     await store.aput(
@@ -553,7 +572,7 @@ async def book_transfer(
         "user_data",
         user_data.value
     )
-    logger.debug("Order saved successfully")
+    logger.info("Order saved successfully")
 
     subject, body = render_transfer_confirmation_email(
         customer_name=", ".join(
@@ -577,10 +596,11 @@ async def book_transfer(
             "offer", {}).get("cancellation", "N/A"),
     )
 
-    logger.debug("Sending confirmation email to %d recipient(s)",
+    logger.info("Sending confirmation email to %d recipient(s)",
                  len(passengers))
+    to_set = set([passenger.contacts.email for passenger in passengers])
     send_email(
-        to=[passenger.contacts.email for passenger in passengers],
+        to=list(to_set),
         from_address=f"{os.environ.get('EMAIL_SENDER_NAME', 'Amadeus Transfers Agent')} <confirmation.transfers@{os.environ.get('EMAIL_DOMAIN')}>",
         subject=subject,
         html_content=body
@@ -602,7 +622,7 @@ async def cancel_transfer(
     client = CLIENT
     store = runtime.store
 
-    logger.debug("Calling Amadeus API for transfer cancellation")
+    logger.info("Calling Amadeus API for transfer cancellation")
     response = await client.cancel_transfer(
         order_id=orderId,
         confirm_nbr=confirmationNumber
@@ -617,7 +637,7 @@ async def cancel_transfer(
             res += f"[{err.get('code')}] {err.get('title')}: {err.get('detail')}\n"
         return res
 
-    logger.debug("Updating order status in user data")
+    logger.info("Updating order status in user data")
     user_data = await store.aget(
         (runtime.context.agent_id,),
         "user_data"
@@ -663,10 +683,10 @@ async def cancel_transfer(
             ) or "N/A",
             vehicle_type=order.get("offer", {}).get("vehicle", "N/A"),
         )
-        logger.debug("Sending cancellation email")
+        logger.info("Sending cancellation email")
         send_email(
-            to=[p['contacts']['email']
-                for p in order.get("data", {}).get("passengers", [])],
+            to=list(set([p['contacts']['email']
+                for p in order.get("data", {}).get("passengers", [])])),
             from_address=f"{os.environ.get('EMAIL_SENDER_NAME', 'Amadeus Transfers Agent')} <cancellation.transfers@{os.environ.get("EMAIL_DOMAIN")}>",
             subject=subject,
             html_content=body
@@ -738,7 +758,7 @@ class AgentAI:
     def _get_database_uri(self) -> str:
         DB_USER = os.environ.get("POSTGRES_USER")
         DB_PASSWORD = os.environ.get("POSTGRES_PASSWORD")
-        DB_HOST = "localhost" # os.environ.get("POSTGRES_HOST")
+        DB_HOST = os.environ.get("POSTGRES_HOST")
         DB_PORT = os.environ.get("POSTGRES_PORT")
         DB_NAME = os.environ.get("POSTGRES_DB")
 
@@ -754,16 +774,42 @@ class AgentAI:
         PROMPT_PATH = Path(__file__).parent / "prompt.md"
 
         self._agent = create_agent(
-            model=os.environ.get("AGENT_MODEL", "gpt-4o-mini"),
+            model=os.environ.get("AGENT_MODEL", "gpt-4o"),
             tools=self.TOOLS,
             checkpointer=self._checkpointer,
             store=self._store,
             context_schema=UserSessionContext,
             system_prompt=PROMPT_PATH.read_text(),
+            middleware=[
+                HumanInTheLoopMiddleware(
+                    interrupt_on={
+                        "book_transfer": {"allowed_decisions": ["approve", "reject"]},  # Requires approval before booking
+                        # Other tools don't need approval
+                        "cancel_transfer": False,
+                        "search_transfers": False,
+                        "add_passengers": False,
+                        "list_passengers": False,
+                        "list_active_orders": False,
+                        "remove_passenger": False,
+                    },
+                    description_prefix="Payment confirmation required",
+                ),
+            ],
         )
 
-    async def ask_agent(self, thread_id: str, agent_id: str, question: str) -> str:
+    async def ask_agent(
+        self,
+        thread_id: str,
+        agent_id: str,
+        question: str
+    ) -> dict[str, Any]:
+        """
+        Process agent request and handle interrupts for payment.
 
+        Returns:
+            - If interrupted: {"status": "interrupted", "payment_required": {...}}
+            - If completed: {"status": "completed", "message": "..."}
+        """
         if not self._agent:
             await self._setup_agent()
 
@@ -786,7 +832,108 @@ class AgentAI:
             )
         )
 
-        return str(result["messages"][-1].content)
+        # Check for interrupt (payment needed)
+        if "__interrupt__" in result:
+
+            print(result["__interrupt__"])
+
+            interrupt_data = result["__interrupt__"][0].value
+            action_request = interrupt_data["action_requests"][0]
+
+            # Extract booking details - use "args" not "arguments"
+            offer_id = action_request["args"]["offerId"]
+            passengers = action_request["args"]["passengers"]
+
+            # Fetch offer details from store to get price
+            store = self._store
+            transfer_search_responses = await store.aget(
+                (thread_id, agent_id),
+                "transfer_search_responses"
+            )
+
+            payment_info = None
+            if transfer_search_responses:
+                offer_data = transfer_search_responses.value.get(offer_id)
+                if offer_data:
+                # Build payment structure
+                    payment_info = {
+                        "amount": offer_data.get("price"),
+                        "amount_usdc": offer_data.get("price"),
+                        "currency": offer_data.get("currency"),
+                        "offer_id": offer_id,
+                        "passenger_count": len(passengers),
+                        "passengers": [
+                        {
+                            "name": f"{p['title']} {p['firstName']} {p['lastName']}",
+                            "email": p['contacts']['email'],
+                            "phone": p['contacts']['phoneNumber']
+                        }
+                        for p in passengers
+                        ],
+                        "pickup_location": offer_data.get("startLocation"),
+                        "dropoff_location": offer_data.get("endLocation"),
+                        "pickup_datetime": offer_data.get("startDateTime"),
+                        "vehicle_type": offer_data.get("vehicle"),
+                        "provider": offer_data.get("provider"),
+                    }
+
+            return {
+                "status": "interrupted",
+                "payment_required": payment_info
+            }
+
+        return {
+            "status": "completed",
+            "message": str(result["messages"][-1].content)
+        }
+
+    async def confirm_payment(
+        self,
+        thread_id: str,
+        agent_id: str,
+        approved: bool,
+        rejection_reason: str | None = None
+    ) -> dict[str, Any]:
+        """Resume agent execution after payment confirmation."""
+
+        config: RunnableConfig = {
+            "configurable": {
+                "thread_id": thread_id,
+            }
+        }
+
+        if approved:
+            # Payment went through - approve the booking
+            result = await self._agent.ainvoke(
+                Command(resume={"decisions": [{"type": "approve"}]}),
+                config,
+                context=UserSessionContext(
+                    thread_id=thread_id,
+                    agent_id=agent_id
+                )
+            )
+        else:
+            # Payment failed - reject the booking
+            result = await self._agent.ainvoke(
+                Command(
+                    resume={
+                        "decisions": [{
+                            "type": "reject",
+                            "message": rejection_reason or "Payment processing failed"
+                        }]
+                    }
+                ),
+                config,
+                context=UserSessionContext(
+                    thread_id=thread_id,
+                    agent_id=agent_id
+                )
+            )
+
+        return {
+            "status": "completed",
+            "message": str(result["messages"][-1].content)
+        }
 
 
 AI = AgentAI()
