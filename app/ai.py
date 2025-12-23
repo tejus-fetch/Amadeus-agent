@@ -6,6 +6,8 @@ from pathlib import Path
 from random import randint
 from typing import Any, Literal
 
+import httpx
+import requests
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain.tools import ToolRuntime, tool
@@ -19,7 +21,6 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, EmailStr, Field
 
 from app.api import CLIENT, TransferBookingRequest, TransferSearchRequest
-import requests
 from app.notification import (
     render_transfer_cancellation_email,
     render_transfer_confirmation_email,
@@ -39,6 +40,78 @@ _formatter = logging.Formatter(
 )
 _handler.setFormatter(_formatter)
 logger.addHandler(_handler)
+
+
+def _fx_to_usdc(amount: float, currency: str) -> float | None:
+    """Convert amount in given currency to USDC using FreeCurrencyAPI; returns string like '12.34' or None on failure."""
+    try:
+        amt = float(amount)
+    except Exception:
+        return None
+    cur = (currency or "").upper()
+    if not cur:
+        return None
+    if cur in {"USD", "USDC"}:
+        return float(f"{amt:.2f}")
+    try:
+        key = os.getenv("FREECURRENCYAPI_KEY", "")
+        if not key:
+            return None
+        with httpx.Client(timeout=10.0) as client:
+            r = client.get("https://api.freecurrencyapi.com/v1/latest",
+                           params={"apikey": key, "currencies": cur})
+        if r.status_code >= 400:
+            return None
+        data = r.json() or {}
+        rates = data.get("data") or {}
+        usd_to_cur = float(rates.get(cur)) if cur in rates else None
+        if not usd_to_cur or usd_to_cur <= 0:
+            return None
+        usd_per_cur = 1.0 / usd_to_cur
+        return float(f"{(amt * usd_per_cur):.2f}")
+    except Exception:
+        return None
+
+
+def _fet_usdc_price() -> float | None:
+    """Fetch FET/USDC price from Binance; returns USDC per 1 FET."""
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            r = client.get(
+                "https://api.binance.com/api/v3/ticker/price", params={"symbol": "FETUSDC"})
+        if r.status_code >= 400:
+            return None
+        data = r.json() or {}
+        price = float(data.get("price"))
+        return price if price > 0 else None
+    except Exception:
+        return None
+
+
+def _usdc_to_fet(amount_usdc: float) -> float | None:
+    """Convert a USDC amount to FET using Binance price. Returns a string with 6 decimals, or None."""
+    try:
+        amt = float(amount_usdc)
+        px = _fet_usdc_price()
+        if not px or px <= 0:
+            return None
+        fet = amt / px
+        return float(f"{fet:.6f}")
+    except Exception:
+        return None
+
+
+def _fet_to_usdc(amount_fet: float) -> float | None:
+    """Convert a FET amount to USDC using Binance price. Returns a string with 2 decimals, or None."""
+    try:
+        amt = float(amount_fet)
+        px = _fet_usdc_price()
+        if not px or px <= 0:
+            return None
+        usdc = amt * px
+        return float(f"{usdc:.2f}")
+    except Exception:
+        return None
 
 # -------------------------------
 # 1. Custom Agent State
@@ -64,23 +137,46 @@ class Location(BaseModel):
     countryCode: str | None = None
 
     def _get_geo_codes(self) -> str:
-        url = "https://nominatim.openstreetmap.org/search"
-        params = {
-            "q": self.value,
-            "format": "json",
-            "limit": 1
-        }
-        headers = {
-            "User-Agent": "amadeus-agent"
-        }
+        # Try Google Maps API first
+        api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+        if api_key:
+            try:
+                url = "https://maps.googleapis.com/maps/api/geocode/json"
+                params: dict[str, str] = {
+                    "address": self.value,
+                    "key": api_key,
+                }
 
-        res = requests.get(url, params=params, headers=headers)
-        data = res.json()
+                res = requests.get(url, params=params, timeout=10)
+                data = res.json()
 
-        if not data:
-            return "48.858093,2.294694"  # Default fallback
+                if data.get("status") == "OK" and data.get("results"):
+                    location = data["results"][0]["geometry"]["location"]
+                    return f"{location['lat']},{location['lng']}"
+            except Exception:
+                pass  # Fall through to OpenStreetMap
 
-        return f"{data[0]['lat']},{data[0]['lon']}"
+        # Fallback to OpenStreetMap Nominatim
+        try:
+            url = "https://nominatim.openstreetmap.org/search"
+            params: dict[str, str] = {
+                "q": self.value,
+                "format": "json",
+                "limit": "1"
+            }
+            headers = {
+                "User-Agent": "amadeus-agent"
+            }
+
+            res = requests.get(url, params=params, headers=headers, timeout=10)
+            data = res.json()
+
+            if data:
+                return f"{data[0]['lat']},{data[0]['lon']}"
+        except Exception:
+            pass
+
+        return "48.858093,2.294694"  # Default fallback
 
     def to_api(self, locationType: Literal["start", "end"]) -> dict[str, Any]:
         data: dict[str, Any] = {}
@@ -204,7 +300,9 @@ async def add_passengers(
     if not user_data:
         data = {
             "passengers": {},
-            "orders": []
+            "orders": [],
+            "balance": 0.0,
+            "payments": {}
         }
     else:
         data = user_data.value
@@ -213,7 +311,7 @@ async def add_passengers(
 
     for p in passengers:
         logger.info("Adding passenger: %s %s %s",
-                     p.title, p.firstName, p.lastName)
+                    p.title, p.firstName, p.lastName)
         pid = None
         while pid is None or pid in existing_passengers:
             pid = f"passenger_{randint(1000, 9999)}"
@@ -256,7 +354,9 @@ async def list_passengers(
     if not user_data:
         data = {
             "passengers": {},
-            "orders": []
+            "orders": [],
+            "balance": 0.0,
+            "payments": {}
         }
         await store.aput(
             (runtime.context.agent_id,),
@@ -358,7 +458,9 @@ async def list_active_orders(
         logger.info("No user data found, initializing new user data")
         data = {
             "passengers": {},
-            "orders": []
+            "orders": [],
+            "balance": 0.0,
+            "payments": {}
         }
         await store.aput(
             (runtime.context.agent_id,),
@@ -422,12 +524,30 @@ async def search_transfers(
     logger.info("Transfer search request: %s", req.to_api())
 
     logger.info("Calling Amadeus API for transfer search")
-    response = await client.search_transfers(req)
+    try:
+        response = await client.search_transfers(req)
+        if not response.is_success:
+            logger.error("Search failed with errors: %s", response.errors)
+            res = ""
+            for err in response.errors:
+                if isinstance(err, dict):
+                    logger.error("Search error: [%s] %s: %s", err.get(
+                        'code'), err.get('title'), err.get('detail'))
+                    res += f"[{err.get('code')}] {err.get('title')}: {err.get('detail')}\n"
+                else:
+                    logger.error(
+                        "Search error: [%s] %s: %s", err.code, err.title, err.detail)
+                    res += f"[{err.code}] {err.title}: {err.detail}\n"
+            return res + "Please modify your search criteria and try again. (Don't show internal error details to user)"
+    except Exception as e:
+        logger.error("Transfer search failed: %s", e)
+        return f"Error: Transfer search failed due to {e}: Don't tell user the internal error details. Please try again later."
     logger.info("Received response from Amadeus API")
 
     response.only_invoice()
     response.best_offer(count=offersCount, page=pageCount)
-    logger.info("Filtered to %d best offer(s) with invoice payment", len(response.to_dict()))
+    logger.info("Filtered to %d best offer(s) with invoice payment",
+                len(response.to_dict()))
 
     store = runtime.store
 
@@ -453,7 +573,7 @@ async def search_transfers(
     )
 
     logger.info(f"Transfer search completed successfully - {response}")
-    return str(response)
+    return response.to_str()
 
 
 @tool(args_schema=TransferBooking)
@@ -469,7 +589,7 @@ async def book_transfer(
     store = runtime.store
 
     logger.info("Preparing booking data with %d passenger(s)",
-                 len(passengers))
+                len(passengers))
     booking_data: dict[str, Any] = {
         "data": {
             "passengers": [
@@ -489,6 +609,33 @@ async def book_transfer(
         }
     }
 
+    user_data = await store.aget(
+        (runtime.context.agent_id,),
+        "user_data"
+    )
+    if not user_data:
+        logger.warning("No user data found for agent_id=%s",
+                       runtime.context.agent_id)
+        data = {
+            "passengers": {},
+            "orders": [],
+            "balance": 0.0,
+            "payments": {}
+        }
+        await store.aput(
+            (runtime.context.agent_id,),
+            "user_data",
+            data
+        )
+        return "Error: No user data found. Please try again."
+    else:
+        data = user_data.value
+
+    payment_ctx = data.get("payments", {}).get(f"{runtime.context.agent_id}:{runtime.context.thread_id}:{offerId}", None)
+    if not payment_ctx:
+        logger.error("No payment context found for booking")
+        return "Error: No payment context found. Please initiate payment before booking."
+
     logger.info("Loading transfer search responses from store")
     transfer_search_responses = await store.aget(
         (runtime.context.thread_id, runtime.context.agent_id),
@@ -497,7 +644,21 @@ async def book_transfer(
 
     if not transfer_search_responses:
         logger.error("No transfer search responses found for booking")
-        return "Error: No transfer search responses found. Please search for transfers before booking."
+
+        data["balance"] += payment_ctx.get("total_fet", 0.0)
+
+        await store.aput(
+            (runtime.context.agent_id,),
+            "user_data",
+            data
+        )
+        await store.aput(
+            (runtime.context.thread_id, runtime.context.agent_id),
+            "transfer_search_responses",
+            {}
+        )
+
+        return f"Error: No transfer search responses found. Please search for transfers before booking. Your payment of {payment_ctx.get('total_fet', 0.0)} FET has been refunded to your balance."
 
     order_data = transfer_search_responses.value.get(offerId)
     if order_data:
@@ -506,27 +667,58 @@ async def book_transfer(
     else:
         logger.warning("No offer data found for offerId=%s", offerId)
 
+        data["balance"] += payment_ctx.get("total_fet", 0.0)
+        await store.aput(
+            (runtime.context.agent_id,),
+            "user_data",
+            data
+        )
+
+        return f"Error: No order data found for offerId={offerId}. Please search for transfers before booking. Your payment of {payment_ctx.get('total_fet', 0.0)} FET has been refunded to your balance."
+
     req = TransferBookingRequest(
         offerId=offerId,
         data=booking_data
     )
 
     logger.info("Calling Amadeus API for transfer booking")
-    response = await client.book_transfer(req)
+    try:
+        response = await client.book_transfer(req)
+    except Exception as e:
+        logger.error("Transfer booking failed: %s", e)
+
+        data["balance"] += payment_ctx.get("total_fet", 0.0)
+
+        await store.aput(
+            (runtime.context.agent_id,),
+            "user_data",
+            data
+        )
+
+        return f"Error: Transfer booking failed. Please try again later. Your payment of {payment_ctx.get('total_fet', 0.0)} FET has been refunded to your balance."
 
     if not response.is_success:
         logger.error("Booking failed for offerId=%s", offerId)
-        res = ""
+        error = ""
         for err in response.errors:
             if isinstance(err, dict):
                 logger.error("Booking error: [%s] %s: %s", err.get(
                     'code'), err.get('title'), err.get('detail'))
-                res += f"[{err.get('code')}] {err.get('title')}: {err.get('detail')}\n"
+                error += f"[{err.get('code')}] {err.get('title')}: {err.get('detail')}\n"
             else:
                 logger.error(
                     "Booking error: [%s] %s: %s", err.code, err.title, err.detail)
-                res += f"[{err.code}] {err.title}: {err.detail}\n"
-        return res
+                error += f"[{err.code}] {err.title}: {err.detail}\n"
+
+        logger.error("Booking failed errors: %s", error)
+
+        data["balance"] += payment_ctx.get("total_fet", 0.0)
+        await store.aput(
+            (runtime.context.agent_id,),
+            "user_data",
+            data
+        )
+        return f"Error: Transfer booking failed:\n{error}, Don't tell user the internal error details. Please try again later. Your payment of {payment_ctx.get('total_fet', 0.0)} FET has been refunded to your balance."
 
     data = response.data or {}
 
@@ -548,29 +740,27 @@ async def book_transfer(
     booking_data["orderId"] = order_id
     booking_data["confirmationNumber"] = confirm_nbr
     booking_data["status"] = "SUCCESS"
+    booking_data["bookedAt"] = datetime.now().isoformat()
+    booking_data["totalPaidFET"] = payment_ctx.get("total_fet", 0.0)
     logger.info(
         "Booking successful: orderId=%s, confirmationNumber=%s", order_id, confirm_nbr)
 
     logger.info("Loading user data to save order")
-    user_data = await store.aget(
-        (runtime.context.agent_id,),
-        "user_data"
-    )
 
-    existing_orders = user_data.value.get("orders")
+    existing_orders = data.get("orders")
     if existing_orders is None:
         existing_orders = []
         logger.info("No existing orders, creating new list")
 
     existing_orders.append(booking_data)
-    user_data.value["orders"] = existing_orders
+    data["orders"] = existing_orders
     logger.info("Saving order to user data, total orders: %d",
-                 len(existing_orders))
+                len(existing_orders))
 
     await store.aput(
         (runtime.context.agent_id,),
         "user_data",
-        user_data.value
+        data
     )
     logger.info("Order saved successfully")
 
@@ -597,7 +787,7 @@ async def book_transfer(
     )
 
     logger.info("Sending confirmation email to %d recipient(s)",
-                 len(passengers))
+                len(passengers))
     to_set = set([passenger.contacts.email for passenger in passengers])
     send_email(
         to=list(to_set),
@@ -623,10 +813,14 @@ async def cancel_transfer(
     store = runtime.store
 
     logger.info("Calling Amadeus API for transfer cancellation")
-    response = await client.cancel_transfer(
-        order_id=orderId,
-        confirm_nbr=confirmationNumber
-    )
+    try:
+        response = await client.cancel_transfer(
+            order_id=orderId,
+            confirm_nbr=confirmationNumber
+        )
+    except Exception as e:
+        logger.error("Transfer cancellation failed: %s", e)
+        return f"Error: Transfer cancellation failed due to {e}: Don't tell user the internal error details. Please try again later."
 
     if "errors" in response:
         logger.error("Cancellation failed for orderId=%s", orderId)
@@ -647,19 +841,30 @@ async def cancel_transfer(
                        runtime.context.agent_id)
         data = {
             "passengers": {},
-            "orders": []
+            "orders": [],
+            "balance": 0.0,
+            "payments": {}
         }
         await store.aput(
             (runtime.context.agent_id,),
             "user_data",
             data
         )
+        logger.info("No user data found, initialized new user data")
+        return "No orders found to cancel."
     else:
         # Update the order status in existing user data
         orders = user_data.value.get("orders", [])
+        refundable_amount_fet = 0.0
         for order in orders:
             if order.get("orderId") == orderId and order.get("confirmationNumber") == confirmationNumber:
                 order["status"] = "CANCELLED"
+                order["cancelledAt"] = datetime.now().isoformat()
+                refundable_amount_fet = order.get("totalPaidFET", 0.0)
+
+                # Refund the amount to user's balance
+                available_balance = user_data.value.get("balance", 0.0)
+                user_data.value["balance"] = available_balance + refundable_amount_fet
                 break
         user_data.value["orders"] = orders
         await store.aput(
@@ -682,11 +887,12 @@ async def cancel_transfer(
                 ]
             ) or "N/A",
             vehicle_type=order.get("offer", {}).get("vehicle", "N/A"),
+            refund_status=f"Refunded {refundable_amount_fet} FET to your account balance." if refundable_amount_fet > 0 else "No refund applicable.",
         )
         logger.info("Sending cancellation email")
         send_email(
             to=list(set([p['contacts']['email']
-                for p in order.get("data", {}).get("passengers", [])])),
+                         for p in order.get("data", {}).get("passengers", [])])),
             from_address=f"{os.environ.get('EMAIL_SENDER_NAME', 'Amadeus Transfers Agent')} <cancellation.transfers@{os.environ.get("EMAIL_DOMAIN")}>",
             subject=subject,
             html_content=body
@@ -695,6 +901,56 @@ async def cancel_transfer(
 
     logger.info("Transfer cancellation successful: orderId=%s", orderId)
     return "Transfer cancellation successful!"
+
+
+@tool
+async def get_current_datetime() -> str:
+    """Get the current date and time in ISO format."""
+    logger.info("Fetching current date and time")
+    currentDatetime = datetime.now().isoformat()
+    logger.info("Current date and time: %s", currentDatetime)
+    return currentDatetime
+
+@tool
+async def get_user_balance(
+    runtime: ToolRuntime[UserSessionContext],
+) -> str:
+    """
+    Get the user's current balance from the user data in the agent context.
+
+    :param runtime: Description
+    :type runtime: ToolRuntime[UserSessionContext]
+    :return: Description
+    :rtype: str
+    """
+    logger.info("Fetching user balance for agent_id=%s", runtime.context.agent_id)
+    store = runtime.store
+
+    logger.info("Loading user data from store")
+    user_data = await store.aget(
+        (runtime.context.agent_id,),
+        "user_data"
+    )
+    if not user_data:
+        logger.info("No user data found for agent_id=%s", runtime.context.agent_id)
+
+        data = {
+            "passengers": {},
+            "orders": [],
+            "balance": 0.0,
+            "payments": {}
+        }
+        await store.aput(
+            (runtime.context.agent_id,),
+            "user_data",
+            data
+        )
+    else:
+        data = user_data.value
+
+    balance = data.get("balance", 0.0)
+    logger.info("User balance is %f FET", balance)
+    return f"Your current balance is {balance:.2f} FET."
 
 
 class AgentAI:
@@ -706,7 +962,9 @@ class AgentAI:
         add_passengers,
         list_passengers,
         list_active_orders,
-        remove_passenger
+        remove_passenger,
+        get_current_datetime,
+        get_user_balance,
     ]
 
     def __init__(self) -> None:
@@ -783,7 +1041,8 @@ class AgentAI:
             middleware=[
                 HumanInTheLoopMiddleware(
                     interrupt_on={
-                        "book_transfer": {"allowed_decisions": ["approve", "reject"]},  # Requires approval before booking
+                        # Requires approval before booking
+                        "book_transfer": {"allowed_decisions": ["approve", "reject"]},
                         # Other tools don't need approval
                         "cancel_transfer": False,
                         "search_transfers": False,
@@ -791,6 +1050,8 @@ class AgentAI:
                         "list_passengers": False,
                         "list_active_orders": False,
                         "remove_passenger": False,
+                        "get_current_datetime": False,
+                        "get_user_balance": False,
                     },
                     description_prefix="Payment confirmation required",
                 ),
@@ -835,8 +1096,6 @@ class AgentAI:
         # Check for interrupt (payment needed)
         if "__interrupt__" in result:
 
-            print(result["__interrupt__"])
-
             interrupt_data = result["__interrupt__"][0].value
             action_request = interrupt_data["action_requests"][0]
 
@@ -851,47 +1110,220 @@ class AgentAI:
                 "transfer_search_responses"
             )
 
+            if not transfer_search_responses:
+                logger.error(
+                    "No transfer search responses found in store during interrupt handling")
+                await store.aput(
+                    (thread_id, agent_id),
+                    "transfer_search_responses",
+                    {}
+                )
+                return {
+                    "status": "completed",
+                    "message": "No transfer search responses found. Please search for transfers before booking."
+                }
+
+            user_data = await store.aget(
+                (agent_id,),
+                "user_data"
+            )
+            if not user_data:
+                logger.error(
+                    "No user data found in store during interrupt handling")
+                await store.aput(
+                    (agent_id,),
+                    "user_data",
+                    {
+                        "passengers": {},
+                        "orders": [],
+                        "balance": 0.0,
+                        "payments": {}
+                    }
+                )
+                return {
+                    "status": "completed",
+                    "message": "No user data found. Please add passengers before booking."
+                }
+
+            data = user_data.value
+            balance = data.get("balance", 0.0)
+
             payment_info = None
             if transfer_search_responses:
                 offer_data = transfer_search_responses.value.get(offer_id)
                 if offer_data:
-                # Build payment structure
-                    payment_info = {
-                        "amount": offer_data.get("price"),
-                        "amount_usdc": offer_data.get("price"),
-                        "currency": offer_data.get("currency"),
-                        "offer_id": offer_id,
-                        "passenger_count": len(passengers),
-                        "passengers": [
-                        {
-                            "name": f"{p['title']} {p['firstName']} {p['lastName']}",
-                            "email": p['contacts']['email'],
-                            "phone": p['contacts']['phoneNumber']
+                    # Build payment structure
+                    amount, currency = offer_data.get("price").split(" ")
+
+                    amount = float(amount) * 0.001
+
+                    amount_usdc = _fx_to_usdc(amount, currency)
+
+                    if not amount_usdc:
+                        logger.error(
+                            "Unsupported currency %s for offerId=%s during interrupt handling", currency, offer_id)
+                        return {
+                            "status": "completed",
+                            "message": f"Unsupported currency {currency} for offerId={offer_id}. Please contact support."
                         }
-                        for p in passengers
-                        ],
-                        "pickup_location": offer_data.get("startLocation"),
-                        "dropoff_location": offer_data.get("endLocation"),
-                        "pickup_datetime": offer_data.get("startDateTime"),
-                        "vehicle_type": offer_data.get("vehicle"),
-                        "provider": offer_data.get("provider"),
+
+                    amount_fet = _usdc_to_fet(amount_usdc)
+
+                    if not amount_fet:
+                        logger.error(
+                            "Failed to convert amount to FET for offerId=%s during interrupt handling", offer_id)
+                        return {
+                            "status": "completed",
+                            "message": f"Failed to process payment for offerId={offer_id}. Please contact support."
+                        }
+
+                    if balance > 0.0:
+                        if amount_fet > balance:
+                            needed_amount_fet = float(amount_fet) - balance
+                            needed_amount_usdc = _fet_to_usdc(needed_amount_fet)
+                            data["balance"] = 0.0
+                            payment_info = {
+                                "total_fet": amount_fet,
+                                "amount": amount,
+                                "currency": currency,
+                                "amount_usdc": needed_amount_usdc,
+                                "amount_fet": needed_amount_fet,
+                                "paid_fet": balance,
+                                "offer_id": offer_id,
+                                "passenger_count": len(passengers),
+                                "passengers": [
+                                    {
+                                        "name": f"{p['title']} {p['firstName']} {p['lastName']}",
+                                        "email": p['contacts']['email'],
+                                        "phone": p['contacts']['phoneNumber']
+                                    }
+                                    for p in passengers
+                                ],
+                                "pickup_location": offer_data.get("startLocation"),
+                                "dropoff_location": offer_data.get("endLocation"),
+                                "pickup_datetime": offer_data.get("startDateTime"),
+                                "vehicle_type": offer_data.get("vehicle"),
+                                "provider": offer_data.get("provider"),
+                            }
+                            data["payments"][f"{agent_id}:{thread_id}:{offer_id}"] = payment_info
+                            await store.aput(
+                                (agent_id,),
+                                "user_data",
+                                data
+                            )
+
+                            return {
+                                "status": "interrupted",
+                                "payment_required": payment_info
+                            }
+
+                        else:
+                            balance -= float(amount_fet)
+                            data["balance"] = balance
+                            payment_info = {
+                                "total_fet": amount_fet,
+                                "amount": 0.0,
+                                "currency": currency,
+                                "amount_usdc": 0.0,
+                                "amount_fet": 0.0,
+                                "paid_fet": amount_fet,
+                                "offer_id": offer_id,
+                                "passenger_count": len(passengers),
+                                "passengers": [
+                                    {
+                                        "name": f"{p['title']} {p['firstName']} {p['lastName']}",
+                                        "email": p['contacts']['email'],
+                                        "phone": p['contacts']['phoneNumber']
+                                    }
+                                    for p in passengers
+                                ],
+                                "pickup_location": offer_data.get("startLocation"),
+                                "dropoff_location": offer_data.get("endLocation"),
+                                "pickup_datetime": offer_data.get("startDateTime"),
+                                "vehicle_type": offer_data.get("vehicle"),
+                                "provider": offer_data.get("provider"),
+                            }
+                            data["payments"][f"{agent_id}:{thread_id}:{offer_id}"] = payment_info
+
+                            await store.aput(
+                                (agent_id,),
+                                "user_data",
+                                data
+                            )
+
+                            result = await self.confirm_payment(
+                                thread_id=thread_id,
+                                agent_id=agent_id,
+                                approved=True
+                            )
+
+                            return {
+                                "status": "completed",
+                                "message": str(result["message"])
+                            }
+
+                    else:
+
+                        payment_info = {
+                            "total_fet": amount_fet,
+                            "amount": float(amount),
+                            "currency": currency,
+                            "amount_usdc": amount_usdc,
+                            "amount_fet": amount_fet,
+                            "paid_fet": 0.0,
+                            "offer_id": offer_id,
+                            "passenger_count": len(passengers),
+                            "passengers": [
+                                {
+                                    "name": f"{p['title']} {p['firstName']} {p['lastName']}",
+                                    "email": p['contacts']['email'],
+                                    "phone": p['contacts']['phoneNumber']
+                                }
+                                for p in passengers
+                            ],
+                            "pickup_location": offer_data.get("startLocation"),
+                            "dropoff_location": offer_data.get("endLocation"),
+                            "pickup_datetime": offer_data.get("startDateTime"),
+                            "vehicle_type": offer_data.get("vehicle"),
+                            "provider": offer_data.get("provider"),
+                        }
+                        data["payments"][f"{agent_id}:{thread_id}:{offer_id}"] = payment_info
+                        await store.aput(
+                            (agent_id,),
+                            "user_data",
+                            data
+                        )
+
+                        return {
+                            "status": "interrupted",
+                            "payment_required": payment_info
+                        }
+                else:
+                    logger.error(
+                        "No offer data found for offerId=%s during interrupt handling", offer_id)
+                    return {
+                        "status": "completed",
+                        "message": f"No offer data found for offerId={offer_id}. Please search for transfers before booking."
                     }
-
+            else:
+                logger.error(
+                    "No offer data found for offerId=%s during interrupt handling", offer_id)
+                return {
+                    "status": "completed",
+                    "message": f"No offer data found for offerId={offer_id}. Please search for transfers before booking."
+                }
+        else:
             return {
-                "status": "interrupted",
-                "payment_required": payment_info
+                "status": "completed",
+                "message": str(result["messages"][-1].content)
             }
-
-        return {
-            "status": "completed",
-            "message": str(result["messages"][-1].content)
-        }
 
     async def confirm_payment(
         self,
         thread_id: str,
         agent_id: str,
         approved: bool,
+        payment_ctx: dict[str, Any] | None = None,
         rejection_reason: str | None = None
     ) -> dict[str, Any]:
         """Resume agent execution after payment confirmation."""
@@ -901,6 +1333,10 @@ class AgentAI:
                 "thread_id": thread_id,
             }
         }
+
+        store = self._store
+        pre_paid_amount = payment_ctx.get("payment_info", {}).get(
+            "paid_fet", 0.0) if payment_ctx else 0.0
 
         if approved:
             # Payment went through - approve the booking
@@ -914,21 +1350,62 @@ class AgentAI:
             )
         else:
             # Payment failed - reject the booking
-            result = await self._agent.ainvoke(
-                Command(
-                    resume={
-                        "decisions": [{
-                            "type": "reject",
-                            "message": rejection_reason or "Payment processing failed"
-                        }]
-                    }
-                ),
-                config,
-                context=UserSessionContext(
-                    thread_id=thread_id,
-                    agent_id=agent_id
+
+            if pre_paid_amount and pre_paid_amount > 0.0:
+                # Refund pre-paid amount to user balance
+                user_data = await store.aget(
+                    (agent_id,),
+                    "user_data"
                 )
-            )
+                if not user_data:
+                    data = {
+                        "passengers": {},
+                        "orders": [],
+                        "balance": pre_paid_amount,
+                        "payments": {}
+                    }
+                else:
+                    data = user_data.value
+                    balance = data.get("balance", 0.0)
+                    balance += pre_paid_amount
+                    data["balance"] = balance
+                await store.aput(
+                    (agent_id,),
+                    "user_data",
+                    data
+                )
+
+                result = await self._agent.ainvoke(
+                    Command(
+                        resume={
+                            "decisions": [{
+                                "type": "reject",
+                                "message": f"Payment verification failed. Refunded amount: {pre_paid_amount} to user balance. Reason: {rejection_reason or 'N/A'}"
+                            }]
+                        }
+                    ),
+                    config,
+                    context=UserSessionContext(
+                        thread_id=thread_id,
+                        agent_id=agent_id
+                    )
+                )
+            else:
+                result = await self._agent.ainvoke(
+                    Command(
+                        resume={
+                            "decisions": [{
+                                "type": "reject",
+                                "message": f"Payment verification failed. Reason: {rejection_reason or 'N/A'}"
+                            }]
+                        }
+                    ),
+                    config,
+                    context=UserSessionContext(
+                        thread_id=thread_id,
+                        agent_id=agent_id
+                    )
+                )
 
         return {
             "status": "completed",

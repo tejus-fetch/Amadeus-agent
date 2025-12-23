@@ -1,6 +1,5 @@
 import os
 from datetime import datetime
-from logging import Logger
 from uuid import uuid4
 
 from uagents import Agent, Context, Protocol
@@ -27,40 +26,48 @@ from app.skyfire import verify_and_charge
 async def send_payment_request(
     ctx: Context,
     sender: str,
-    amount_usdc: str,
+    amount_usdc: float | None,
+    amount_fet: float | None,
     description: str,
     deadline_seconds: int = 300
-) -> None:
+) -> dict[str, str]:
     """
     Send a payment request to the user via uAgents payment protocol.
 
     Args:
         ctx: uAgents context
         sender: User address to send payment request to
-        amount_usdc: Amount in USDC (as string, e.g., "12.50")
+        amount_usdc: Amount in USDC to request (optional)
+        amount_fet: Amount in FET to request (optional)
         description: Description of what the payment is for
         deadline_seconds: How long the payment request is valid (default 5 minutes)
     """
-
-    FIXED_FEE = "0.001"
-
     # Get Skyfire service ID from environment
     skyfire_service_id = os.getenv("SELLER_SERVICE_ID")
     wallet_address = "fetch1casrcthxesrsgyfy56yzfuecq49h3h76afzwg7"
 
     # Define accepted payment methods
-    accepted_funds = [
-        Funds(
-            currency="USDC",
-            amount=FIXED_FEE,
-            payment_method="skyfire"
-        ),
-        Funds(
-            currency="FET",
-            amount=FIXED_FEE,
-            payment_method="fet_direct"
+    accepted_funds: list[Funds] = []
+    if amount_usdc is not None:
+        accepted_funds.append(
+            Funds(
+                currency="USDC",
+                amount=f"{amount_usdc:.2f}",
+                payment_method="skyfire"
+            )
         )
-    ]
+    if amount_fet is not None:
+        accepted_funds.append(
+            Funds(
+                currency="FET",
+                amount=f"{amount_fet:.5f}",
+                payment_method="fet_direct"
+            )
+        )
+
+    if len(accepted_funds) == 0:
+        ctx.logger.error("No accepted funds specified for payment request")
+        return {"status": "error", "message": "No accepted funds specified"}
 
     # Build metadata for payment request
     metadata = {}
@@ -90,6 +97,13 @@ async def send_payment_request(
         f"Payment request sent to {sender}: {amount_usdc} USDC, "
         f"description: {description}"
     )
+
+    return {
+        "status": "sent",
+        "amount_usdc": f"{amount_usdc:.2f}",
+        "amount_fet": f"{amount_fet:.6f}"
+    }
+
 
 def create_agent() -> Agent:
     agent = Agent(
@@ -216,10 +230,11 @@ def create_agent() -> Agent:
                             )
 
                             # Send payment request
-                            await send_payment_request(
+                            res = await send_payment_request(
                                 ctx=ctx,
                                 sender=sender,
                                 amount_usdc=payment_info["amount_usdc"],
+                                amount_fet=payment_info["amount_fet"],
                                 description=(
                                     f"Transfer booking: "
                                     f"{payment_info['pickup_location']} → "
@@ -227,26 +242,51 @@ def create_agent() -> Agent:
                                 )
                             )
 
-                            await ctx.send(sender, ChatMessage(
-                                timestamp=datetime.now(),
-                                msg_id=uuid4(),
-                                content=[
-                                    TextContent(
-                                        type="text",
-                                        text=(
-                                            f"💳 **Payment Required**\n\n"
-                                            f"**Amount:** {payment_info['amount_usdc']} USDC\n\n"
-                                            f"**Route:** {payment_info['pickup_location']} → "
-                                            f"{payment_info['dropoff_location']}\n\n"
-                                            f"**Pickup:** {payment_info['pickup_datetime']}\n\n"
-                                            f"**Vehicle:** {payment_info['vehicle_type']}\n\n"
-                                            f"**Provider:** {payment_info['provider']}\n\n"
-                                            f"**Passengers:** {payment_info['passenger_count']}\n\n"
-                                            f"Please complete the payment to confirm your booking."
+                            if res.get("status") != "sent":
+                                await ctx.send(sender, ChatMessage(
+                                    timestamp=datetime.now(),
+                                    msg_id=uuid4(),
+                                    content=[
+                                        TextContent(
+                                            type="text",
+                                            text=(
+                                                "⚠️ Failed to initiate payment request. "
+                                                "Please try again later."
+                                            )
                                         )
-                                    )
-                                ]
-                            ))
+                                    ]
+                                ))
+                                ctx.logger.error(
+                                    f"Failed to send payment request to {sender} "
+                                    f"for session_id: {session_id_str}"
+                                )
+
+                            else:
+                                request_overview = ""
+                                request_overview += "💳 **Payment Required**\n\n"
+                                request_overview += f"**Total Amount:** {payment_info['amount']} {payment_info['currency']}\n\n"
+                                request_overview += f"**USDC Amount (To be paid):** {res['amount_usdc']} USDC\n\n"
+                                request_overview += f"**FET Amount (To be paid):** {res['amount_fet']} FET\n\n"
+                                if payment_info["paid_fet"] > 0:
+                                    request_overview += f"**Already Paid:** {payment_info['paid_fet']} FET (from credits)\n\n"
+                                request_overview += f"**Route:** {payment_info['pickup_location']} → "
+                                request_overview += f"{payment_info['dropoff_location']}\n\n"
+                                request_overview += f"**Pickup:** {payment_info['pickup_datetime']}\n\n"
+                                request_overview += f"**Vehicle:** {payment_info['vehicle_type']}\n\n"
+                                request_overview += f"**Provider:** {payment_info['provider']}\n\n"
+                                request_overview += f"**Passengers:** {payment_info['passenger_count']}\n\n"
+                                request_overview += "Please complete the payment to confirm your booking. You can pay using USDC via Skyfire or FET tokens. Thank you!"
+
+                                await ctx.send(sender, ChatMessage(
+                                    timestamp=datetime.now(),
+                                    msg_id=uuid4(),
+                                    content=[
+                                        TextContent(
+                                            type="text",
+                                            text=request_overview
+                                        )
+                                    ]
+                                ))
 
                 except Exception as content_error:
                     error_type = type(content_error).__name__
@@ -351,7 +391,8 @@ def create_agent() -> Agent:
                 result = await AI.confirm_payment(
                     thread_id=payment_ctx["thread_id"],
                     agent_id=payment_ctx["agent_id"],
-                    approved=True
+                    approved=True,
+                    payment_ctx=payment_ctx
                 )
 
                 # Send booking result
@@ -363,6 +404,11 @@ def create_agent() -> Agent:
                     ]
                 ))
 
+                ctx.logger.info(
+                    f"Booking completed for {sender} in session {session_id_str}"
+                )
+                ctx.logger.info(f"Response: {result['message']}")
+
             except Exception as e:
                 ctx.logger.error(
                     f"Booking completion error: {e}", exc_info=True)
@@ -372,7 +418,7 @@ def create_agent() -> Agent:
                     content=[
                         TextContent(
                             type="text",
-                            text=f"Payment verified but booking failed: {str(e)}"
+                            text="Payment verified but booking failed, please try again."
                         )
                     ]
                 ))
@@ -389,24 +435,29 @@ def create_agent() -> Agent:
                 reason="Payment verification failed. Please try again."
             ))
 
-            # Notify user
+            result = await AI.confirm_payment(
+                thread_id=payment_ctx["thread_id"],
+                agent_id=payment_ctx["agent_id"],
+                approved=False,
+                rejection_reason="Payment verification failed",
+                payment_ctx=payment_ctx
+            )
+
+            ctx.logger.info(
+                f"Payment rejected for {sender} in session {session_id_str}"
+            )
+            ctx.logger.info(f"Response: {result['message']}")
+
             await ctx.send(sender, ChatMessage(
                 timestamp=datetime.now(),
                 msg_id=uuid4(),
                 content=[
                     TextContent(
                         type="text",
-                        text="❌ Payment verification failed. Please try again or contact support."
+                        text=result["message"]
                     )
                 ]
             ))
-
-            result = await AI.confirm_payment(
-                thread_id=payment_ctx["thread_id"],
-                agent_id=payment_ctx["agent_id"],
-                approved=False,
-                rejection_reason="Payment verification failed"
-            )
 
         apa = ctx.storage.get("active_payment_agents")
         if (str(ctx.session), sender) in apa:
@@ -423,6 +474,39 @@ def create_agent() -> Agent:
         session_id_str = str(ctx.session)
         payment_ctx_key = f"pending_payment:{sender}:{session_id_str}"
         if ctx.storage.has(payment_ctx_key):
+
+            await ctx.send(sender, ChatMessage(
+                timestamp=datetime.now(),
+                msg_id=uuid4(),
+                content=[
+                    TextContent(
+                        type="text",
+                        text="⚠️ You have rejected the payment. Please wait while we cancel your booking."
+                    )
+                ]
+            ))
+
+            payment_ctx = ctx.storage.get(payment_ctx_key)
+
+            result = await AI.confirm_payment(
+                thread_id=session_id_str,
+                agent_id=sender,
+                approved=False,
+                rejection_reason="User rejected the payment",
+                payment_ctx=payment_ctx
+            )
+
+            await ctx.send(sender, ChatMessage(
+                timestamp=datetime.now(),
+                msg_id=uuid4(),
+                content=[
+                    TextContent(
+                        type="text",
+                        text=result["message"]
+                    )
+                ]
+            ))
+
             ctx.storage.remove(payment_ctx_key)
             apa = ctx.storage.get("active_payment_agents")
             if (str(ctx.session), sender) in apa:

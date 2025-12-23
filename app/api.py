@@ -323,6 +323,12 @@ class TransferOffer(LooseBaseModel):
 class TransferSearchResponse(LooseBaseModel):
     data: list[dict[str, Any]] = Field(default_factory=list)
     processed: list[dict[str, Any]] = Field(default_factory=list)
+    errors: list[dict[str, Any]] | None = None
+
+    @property
+    def is_success(self) -> bool:
+        """Check if the booking was successful."""
+        return len(self.data) > 0 and not self.errors
 
     def only_invoice(self) -> None:
         """Filter offers to only those accepting INVOICE payment."""
@@ -390,7 +396,7 @@ class TransferSearchResponse(LooseBaseModel):
 
         return information
 
-    def __str__(self) -> str:
+    def to_str(self) -> str:
         lines: list[str] = []
 
         for idx, offer in enumerate(self.processed, start=1):
@@ -711,8 +717,6 @@ class AmadeusTransferAsyncClient:
 
             except httpx.HTTPError as exc:
                 logger.error("Request failed: %s", exc)
-                if attempt == self.retries:
-                    raise
                 await asyncio.sleep(2 ** attempt)
 
         raise RuntimeError("Unreachable")
@@ -731,12 +735,15 @@ class AmadeusTransferAsyncClient:
         if cached:
             logger.info("Returning cached transfer search result")
             return cached
-
-        raw = await self._request(
-            "POST",
-            "/shopping/transfer-offers",
-            json=request.to_api(),
-        )
+        try:
+            raw = await self._request(
+                "POST",
+                "/shopping/transfer-offers",
+                json=request.to_api(),
+            )
+        except Exception as e:
+            logger.error("Transfer search failed: %s", e)
+            raise
 
         parsed = TransferSearchResponse.model_validate(raw)
         self._cache.set(str(cache_key), parsed)
@@ -745,23 +752,30 @@ class AmadeusTransferAsyncClient:
     async def book_transfer(
         self, request: TransferBookingRequest
     ) -> TransferBookingResponse:
-        raw = await self._request(
-            "POST",
-            "/ordering/transfer-orders",
-            json=request.data,
-            params={"offerId": request.offerId},
-        )
+        try:
+            raw = await self._request(
+                "POST",
+                "/ordering/transfer-orders",
+                json=request.data,
+                params={"offerId": request.offerId},
+            )
+        except Exception as e:
+            logger.error("Transfer booking failed: %s", e)
+            raise
         return TransferBookingResponse.model_validate(raw)
 
     async def cancel_transfer(
         self, order_id: str, confirm_nbr: str
     ) -> dict[str, Any]:
-        return await self._request(
-            "POST",
-            f"/ordering/transfer-orders/{order_id}/transfers/cancellation",
-            params={"confirmNbr": confirm_nbr},
-        )
-
+        try:
+            return await self._request(
+                "POST",
+                f"/ordering/transfer-orders/{order_id}/transfers/cancellation",
+                params={"confirmNbr": confirm_nbr},
+            )
+        except Exception as e:
+            logger.error("Transfer cancellation failed: %s", e)
+            raise
     async def close(self) -> None:
         """Close underlying HTTP client."""
         await self._client.aclose()
